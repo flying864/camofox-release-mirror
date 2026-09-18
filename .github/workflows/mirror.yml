@@ -20,6 +20,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Install digest-preserving registry copier on temporary runner
+        run: sudo apt-get update -qq && sudo apt-get install -y skopeo
       - name: Validate official release and optionally publish
         env:
           PUBLISH: ${{ inputs.publish }}

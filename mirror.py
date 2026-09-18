@@ -105,8 +105,7 @@ def main():
         if not password:
             raise RuntimeError('Smoke tests passed; publication blocked: DOCKERHUB_TOKEN secret missing')
         subprocess.run(['docker', 'login', '-u', 'flying864', '--password-stdin'], input=password, text=True, check=True, timeout=60)
-        run('docker', 'tag', source, TARGET)
-        run('docker', 'push', TARGET)
+        run('skopeo', 'copy', '--preserve-digests', '--authfile', os.path.join(os.environ['DOCKER_CONFIG'], 'config.json'), 'docker://' + source, 'docker://' + TARGET)
         for attempt in range(5):
             current, headers = hub_manifest()
             if identity(current) == identity(source_manifest):
