@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import shutil
 import time
 import urllib.request
 import uuid
@@ -118,6 +119,9 @@ def main():
         password = os.environ.get('DOCKERHUB_TOKEN')
         if not password:
             raise RuntimeError('Smoke tests passed; publication blocked: DOCKERHUB_TOKEN secret missing')
+        if not shutil.which('skopeo'):
+            run('sudo', 'apt-get', 'update', '-qq')
+            run('sudo', 'apt-get', 'install', '-y', '-qq', '--no-install-recommends', 'skopeo')
         subprocess.run(['docker', 'login', '-u', 'flying864', '--password-stdin'], input=password, text=True, check=True, timeout=60)
         run('skopeo', 'copy', '--preserve-digests', '--authfile', os.path.join(os.environ['DOCKER_CONFIG'], 'config.json'), 'docker://' + source, 'docker://' + TARGET)
         for attempt in range(5):
