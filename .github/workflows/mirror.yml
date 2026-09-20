@@ -1,5 +1,7 @@
 name: Verify and mirror official Camofox
 on:
+  schedule:
+    - cron: '0 2 * * *' # 10:00 Asia/Shanghai
   workflow_dispatch:
     inputs:
       publish:
@@ -20,11 +22,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Test release selection and no-change behavior
+        run: python3 -m unittest -v
       - name: Install digest-preserving registry copier on temporary runner
         run: sudo apt-get update -qq && sudo apt-get install -y skopeo
       - name: Validate official release and optionally publish
         env:
-          PUBLISH: ${{ inputs.publish }}
+          PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           DOCKER_CONFIG: ${{ runner.temp }}/camofox-docker
         run: python3 mirror.py

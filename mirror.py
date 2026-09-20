@@ -1,5 +1,5 @@
 """Official image validation and optional publication; no source builds."""
-import base64
+import urllib.error
 import json
 import os
 import re
@@ -14,8 +14,18 @@ ACCEPT = 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distri
 
 
 def get(url, headers=None):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=40) as r:
-        return json.load(r), r.headers
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=40) as r:
+                return json.load(r), r.headers
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == 2:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == 2:
+                raise
+        time.sleep(2 ** attempt)
+    raise RuntimeError('Network retry budget exhausted')
 
 
 def run(*args):
@@ -62,6 +72,10 @@ def main():
     source = f'ghcr.io/{UPSTREAM}@{child["digest"]}'
     # Capture rollback identity before any publication; fail closed if unavailable.
     previous, previous_headers = hub_manifest()
+    if (os.environ.get('PUBLISH') == 'true'
+            and previous_headers.get('Docker-Content-Digest') == child['digest']
+            and identity(previous) == identity(source_manifest)):
+        return  # Silent no-change path: no Docker calls, no login, no push.
     evidence = {'release': release['tag_name'], 'upstream_index': ih.get('Docker-Content-Digest'), 'upstream_amd64': child['digest'], 'previous_downstream': previous_headers.get('Docker-Content-Digest')}
     print(json.dumps(evidence), flush=True)
     run('docker', 'pull', '--platform', 'linux/amd64', source)
@@ -108,7 +122,7 @@ def main():
         run('skopeo', 'copy', '--preserve-digests', '--authfile', os.path.join(os.environ['DOCKER_CONFIG'], 'config.json'), 'docker://' + source, 'docker://' + TARGET)
         for attempt in range(5):
             current, headers = hub_manifest()
-            if identity(current) == identity(source_manifest):
+            if headers.get('Docker-Content-Digest') == child['digest'] and identity(current) == identity(source_manifest):
                 evidence['downstream_verified'] = headers.get('Docker-Content-Digest')
                 break
             if attempt == 4:
