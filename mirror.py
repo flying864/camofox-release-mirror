@@ -42,6 +42,22 @@ def manifest(host, repo, tag, token):
     return get(f'https://{host}/v2/{repo}/manifests/{tag}', {'Authorization': 'Bearer ' + token, 'Accept': ACCEPT})
 
 
+def missing_manifest(exc):
+    if exc.code != 404:
+        return False
+    body = exc.read(65537)
+    if len(body) > 65536:
+        return False
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    errors = payload.get('errors') if isinstance(payload, dict) else None
+    return isinstance(errors, list) and bool(errors) and all(
+        isinstance(error, dict) and error.get('code') == 'MANIFEST_UNKNOWN'
+        for error in errors)
+
+
 def identity(m):
     return m['config']['digest'], [x['digest'] for x in m['layers']]
 
@@ -67,7 +83,16 @@ def main():
     release = stable(releases)
     version = release['tag_name'][1:]
     token = get(f'https://ghcr.io/token?scope=repository:{UPSTREAM}:pull&service=ghcr.io')[0]['token']
-    index, ih = manifest('ghcr.io', UPSTREAM, version, token)
+    try:
+        index, ih = manifest('ghcr.io', UPSTREAM, version, token)
+    except urllib.error.HTTPError as exc:
+        if not missing_manifest(exc):
+            raise
+        message = f'Official image for {release["tag_name"]} is not available yet; no tests or publication were performed.'
+        print(message, flush=True)
+        with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as f:
+            f.write(message + '\n')
+        return
     child = next(x for x in index['manifests'] if x.get('platform', {}).get('architecture') == 'amd64' and x['platform']['os'] == 'linux')
     source_manifest, _ = manifest('ghcr.io', UPSTREAM, child['digest'], token)
     source = f'ghcr.io/{UPSTREAM}@{child["digest"]}'
