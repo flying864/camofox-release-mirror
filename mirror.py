@@ -71,6 +71,27 @@ def hub_manifest():
     return m, h
 
 
+# Runs only inside the disposable probe container, not in the published image.
+FIXTURE_SERVER = r'''
+const http = require('node:http');
+http.createServer((req, res) => {
+  const match = /^\/probe\/([a-f0-9]{32})$/.exec(req.url);
+  if (!match) { res.writeHead(404); res.end(); return; }
+  res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store'});
+  res.end('<!doctype html><html><head><title>Camofox mirror probe</title></head>' +
+    '<body><h1>Camofox mirror probe</h1><p>' + match[1] + '</p>' +
+    '<a href="/probe/' + match[1] + '#verified">Probe link</a></body></html>');
+}).listen(9380, '127.0.0.1');
+'''
+
+
+def validate_snapshot(snapshot, expected_url, nonce):
+    text = snapshot.get('snapshot')
+    if (snapshot.get('url') != expected_url or not isinstance(text, str)
+            or not all(value in text for value in ('Camofox mirror probe', nonce, 'Probe link'))):
+        raise RuntimeError('Browser smoke content/URL mismatch: ' + json.dumps(snapshot)[:4000])
+
+
 def main():
     releases = []
     for page in range(1, 21):
@@ -123,24 +144,40 @@ def main():
                     raise RuntimeError('Health check deadline exceeded')
                 time.sleep(3)
         assert get(base + '/openapi.json')[0]['info']['version'] == version
+        run('docker', 'exec', '-d', name, 'node', '-e', FIXTURE_SERVER)
+        # Readiness is bounded; no fixed sleep and no dependency on public sites.
+        run('docker', 'exec', name, 'node', '-e', r'''
+const url = 'http://127.0.0.1:9380/probe/' + '0'.repeat(32);
+(async () => {
+  for (let i = 0; i < 30; i++) {
+    try { if ((await fetch(url, {signal: AbortSignal.timeout(1000)})).ok) return; } catch (_) {}
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  throw new Error('Probe fixture readiness deadline exceeded');
+})().catch(e => { console.error(e.message); process.exit(1); });
+''')
         for _ in range(3):
-            user = 'probe-' + uuid.uuid4().hex
+            nonce = uuid.uuid4().hex
+            user = 'probe-' + nonce
+            probe_url = 'http://127.0.0.1:9380/probe/' + nonce
             def api(path, payload=None, method=None):
                 req = urllib.request.Request(base + path, data=json.dumps(payload).encode() if payload is not None else None, headers={'Content-Type': 'application/json'}, method=method)
                 with urllib.request.urlopen(req, timeout=70) as r:
                     return json.load(r)
             try:
-                tab = api('/tabs', {'userId': user, 'sessionKey': user, 'url': 'https://example.com'})['tabId']
+                tab = api('/tabs', {'userId': user, 'sessionKey': user, 'url': probe_url})['tabId']
                 snapshot = api(f'/tabs/{tab}/snapshot?userId={user}')
-                if 'Example Domain' not in snapshot.get('snapshot', ''):
-                    print('SMOKE_DIAGNOSTIC ' + json.dumps(snapshot)[:16000], flush=True)
-                    print('CONTAINER_LOGS ' + run('docker', 'logs', '--tail', '100', name), flush=True)
-                assert 'Example Domain' in snapshot['snapshot']
-                assert snapshot['url'].startswith('https://example.com')
+                validate_snapshot(snapshot, probe_url, nonce)
             finally:
                 api('/sessions/' + user, method='DELETE')
                 assert api('/tabs?userId=' + user)['tabs'] == []
-        evidence['smoke_tests'] = '3 independent sessions: navigation, content, cleanup passed'
+        evidence['smoke_tests'] = '3 independent sessions: controlled HTTP navigation, nonce content, link, exact URL and cleanup passed'
+    except Exception:
+        try:
+            print('PROBE_CONTAINER_LOGS ' + run('docker', 'logs', '--tail', '80', name), flush=True)
+        except Exception as diagnostic_error:
+            print('Probe logs unavailable: ' + type(diagnostic_error).__name__, flush=True)
+        raise
     finally:
         run('docker', 'rm', '-f', name)
     if os.environ.get('PUBLISH') == 'true':
