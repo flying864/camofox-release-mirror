@@ -8,6 +8,9 @@ import shutil
 import time
 import urllib.request
 import uuid
+import tempfile
+import sys
+from contextlib import contextmanager
 
 UPSTREAM = 'jo-inc/camofox-browser'
 TARGET = 'flying864/camofox-browser:latest'
@@ -22,6 +25,7 @@ def get(url, headers=None):
         except urllib.error.HTTPError as exc:
             if exc.code not in (429, 500, 502, 503, 504) or attempt == 2:
                 raise
+            exc.close()
         except (urllib.error.URLError, TimeoutError):
             if attempt == 2:
                 raise
@@ -92,6 +96,42 @@ def validate_snapshot(snapshot, expected_url, nonce):
         raise RuntimeError('Browser smoke content/URL mismatch: ' + json.dumps(snapshot)[:4000])
 
 
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+@contextmanager
+def cleanup_on_exit(action, label):
+    original = sys.exception()
+    try:
+        yield
+    except BaseException as exc:
+        original = exc
+        raise
+    finally:
+        try:
+            action()
+        except Exception as exc:
+            if original is None:
+                raise
+            print(f'{label} cleanup also failed: {type(exc).__name__}', file=sys.stderr)
+
+
+def publish_image(source, password):
+    if not shutil.which('skopeo'):
+        run('sudo', 'apt-get', 'update', '-qq')
+        run('sudo', 'apt-get', 'install', '-y', '-qq', '--no-install-recommends', 'skopeo')
+    # Private, per-run auth; never reuse a user's Docker config. Cleanup also
+    # runs if login/copy raises. The ephemeral GitHub runner is the final backstop.
+    with tempfile.TemporaryDirectory(prefix='camofox-auth-') as authdir:
+        env = dict(os.environ, DOCKER_CONFIG=authdir)
+        subprocess.run(['docker', 'login', '-u', 'flying864', '--password-stdin'],
+                       input=password, text=True, check=True, timeout=60, env=env)
+        run('skopeo', 'copy', '--preserve-digests', '--authfile',
+            os.path.join(authdir, 'config.json'), 'docker://' + source, 'docker://' + TARGET)
+
+
 def main():
     releases = []
     for page in range(1, 21):
@@ -107,7 +147,11 @@ def main():
     try:
         index, ih = manifest('ghcr.io', UPSTREAM, version, token)
     except urllib.error.HTTPError as exc:
-        if not missing_manifest(exc):
+        try:
+            waiting = missing_manifest(exc)
+        finally:
+            exc.close()
+        if not waiting:
             raise
         message = f'Official image for {release["tag_name"]} is not available yet; no tests or publication were performed.'
         print(message, flush=True)
@@ -122,13 +166,15 @@ def main():
     if (os.environ.get('PUBLISH') == 'true'
             and previous_headers.get('Docker-Content-Digest') == child['digest']
             and identity(previous) == identity(source_manifest)):
-        return  # Silent no-change path: no Docker calls, no login, no push.
+        with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as f:
+            f.write('unchanged: official amd64 manifest, config and layers match Docker Hub; no image smoke tests or push performed.\n')
+        return  # Silent stdout; explicit outcome in Actions summary.
     evidence = {'release': release['tag_name'], 'upstream_index': ih.get('Docker-Content-Digest'), 'upstream_amd64': child['digest'], 'previous_downstream': previous_headers.get('Docker-Content-Digest')}
     print(json.dumps(evidence), flush=True)
     run('docker', 'pull', '--platform', 'linux/amd64', source)
     info = json.loads(run('docker', 'image', 'inspect', source))[0]
-    assert info['Architecture'] == 'amd64' and info['Os'] == 'linux'
-    assert info['Id'] == source_manifest['config']['digest']
+    require(info['Architecture'] == 'amd64' and info['Os'] == 'linux', 'Image platform mismatch')
+    require(info['Id'] == source_manifest['config']['digest'], 'Image config digest mismatch')
     name = 'camofox-probe-' + uuid.uuid4().hex[:12]
     try:
         run('docker', 'run', '-d', '--name', name, '--platform', 'linux/amd64', '--shm-size=2g', '-p', '127.0.0.1::9377', source)
@@ -137,13 +183,13 @@ def main():
         deadline = time.monotonic() + 150
         while True:
             try:
-                assert get(base + '/health')[0]['ok']
+                require(get(base + '/health')[0]['ok'] is True, 'Health check not OK')
                 break
             except Exception:
                 if time.monotonic() > deadline:
                     raise RuntimeError('Health check deadline exceeded')
                 time.sleep(3)
-        assert get(base + '/openapi.json')[0]['info']['version'] == version
+        require(get(base + '/openapi.json')[0]['info']['version'] == version, 'Runtime version mismatch')
         run('docker', 'exec', '-d', name, 'node', '-e', FIXTURE_SERVER)
         # Readiness is bounded; no fixed sleep and no dependency on public sites.
         run('docker', 'exec', name, 'node', '-e', r'''
@@ -164,13 +210,13 @@ const url = 'http://127.0.0.1:9380/probe/' + '0'.repeat(32);
                 req = urllib.request.Request(base + path, data=json.dumps(payload).encode() if payload is not None else None, headers={'Content-Type': 'application/json'}, method=method)
                 with urllib.request.urlopen(req, timeout=70) as r:
                     return json.load(r)
-            try:
+            def cleanup_session():
+                api('/sessions/' + user, method='DELETE')
+                require(api('/tabs?userId=' + user)['tabs'] == [], 'Session cleanup left tabs')
+            with cleanup_on_exit(cleanup_session, 'Session'):
                 tab = api('/tabs', {'userId': user, 'sessionKey': user, 'url': probe_url})['tabId']
                 snapshot = api(f'/tabs/{tab}/snapshot?userId={user}')
                 validate_snapshot(snapshot, probe_url, nonce)
-            finally:
-                api('/sessions/' + user, method='DELETE')
-                assert api('/tabs?userId=' + user)['tabs'] == []
         evidence['smoke_tests'] = '3 independent sessions: controlled HTTP navigation, nonce content, link, exact URL and cleanup passed'
     except Exception:
         try:
@@ -179,16 +225,13 @@ const url = 'http://127.0.0.1:9380/probe/' + '0'.repeat(32);
             print('Probe logs unavailable: ' + type(diagnostic_error).__name__, flush=True)
         raise
     finally:
-        run('docker', 'rm', '-f', name)
+        with cleanup_on_exit(lambda: run('docker', 'rm', '-f', name), 'Container'):
+            pass
     if os.environ.get('PUBLISH') == 'true':
         password = os.environ.get('DOCKERHUB_TOKEN')
         if not password:
             raise RuntimeError('Smoke tests passed; publication blocked: DOCKERHUB_TOKEN secret missing')
-        if not shutil.which('skopeo'):
-            run('sudo', 'apt-get', 'update', '-qq')
-            run('sudo', 'apt-get', 'install', '-y', '-qq', '--no-install-recommends', 'skopeo')
-        subprocess.run(['docker', 'login', '-u', 'flying864', '--password-stdin'], input=password, text=True, check=True, timeout=60)
-        run('skopeo', 'copy', '--preserve-digests', '--authfile', os.path.join(os.environ['DOCKER_CONFIG'], 'config.json'), 'docker://' + source, 'docker://' + TARGET)
+        publish_image(source, password)
         for attempt in range(5):
             current, headers = hub_manifest()
             if headers.get('Docker-Content-Digest') == child['digest'] and identity(current) == identity(source_manifest):

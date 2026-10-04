@@ -66,7 +66,8 @@ class MirrorTests(unittest.TestCase):
 
     def test_missing_manifest_requires_404_and_only_manifest_unknown_errors(self):
         valid = b'{"errors":[{"code":"MANIFEST_UNKNOWN"},{"code":"MANIFEST_UNKNOWN"}]}'
-        self.assertTrue(mirror.missing_manifest(http_error(404, valid)))
+        with http_error(404, valid) as exc:
+            self.assertTrue(mirror.missing_manifest(exc))
         for code, body in (
             (401, valid),
             (403, valid),
@@ -86,7 +87,8 @@ class MirrorTests(unittest.TestCase):
             (404, b'x' * 65537),
         ):
             with self.subTest(code=code, body=body[:30]):
-                self.assertFalse(mirror.missing_manifest(http_error(code, body)))
+                with http_error(code, body) as exc:
+                    self.assertFalse(mirror.missing_manifest(exc))
 
     def test_child_manifest_404_still_fails(self):
         index = {'manifests': [{'digest': 'sha256:child', 'platform': {'os': 'linux', 'architecture': 'amd64'}}]}
@@ -95,8 +97,9 @@ class MirrorTests(unittest.TestCase):
              patch.object(mirror, 'manifest', side_effect=[(index, {}), http_error(404, missing)]), \
              patch.object(mirror, 'hub_manifest') as hub_manifest, \
              patch.object(mirror, 'run') as run:
-            with self.assertRaises(urllib.error.HTTPError):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
                 mirror.main()
+            caught.exception.close()
             hub_manifest.assert_not_called()
             run.assert_not_called()
 

@@ -19,14 +19,26 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Reject publication from non-main refs
+        if: ${{ inputs.publish && github.ref != 'refs/heads/main' }}
+        run: |
+          printf '%s\n' 'Publication is allowed only from main.' >&2
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node 24
         with:
           persist-credentials: false
       - name: Test release selection, waiting, and no-change behavior
-        run: python3 -B -m unittest -q
-      - name: Validate official release and optionally publish
+        run: |
+          python3 -B -m unittest -q
+          python3 -B -O -m unittest -q
+      - name: Validate official release without publication credentials
+        if: ${{ github.event_name != 'schedule' && !inputs.publish }}
         env:
-          PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+          PUBLISH: 'false'
+        run: python3 -B mirror.py
+      - name: Validate official release and publish if changed
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || inputs.publish) }}
+        env:
+          PUBLISH: 'true'
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          DOCKER_CONFIG: ${{ runner.temp }}/camofox-docker
         run: python3 -B mirror.py
