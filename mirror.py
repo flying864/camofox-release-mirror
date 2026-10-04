@@ -132,6 +132,9 @@ def main():
             try:
                 tab = api('/tabs', {'userId': user, 'sessionKey': user, 'url': 'https://example.com'})['tabId']
                 snapshot = api(f'/tabs/{tab}/snapshot?userId={user}')
+                if 'Example Domain' not in snapshot.get('snapshot', ''):
+                    print('SMOKE_DIAGNOSTIC ' + json.dumps(snapshot)[:16000], flush=True)
+                    print('CONTAINER_LOGS ' + run('docker', 'logs', '--tail', '100', name), flush=True)
                 assert 'Example Domain' in snapshot['snapshot']
                 assert snapshot['url'].startswith('https://example.com')
             finally:
